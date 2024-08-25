@@ -41,7 +41,7 @@ pub fn get_cm_coordinates<C: CurveGroup>(cm: &C) -> Vec<C::BaseField> {
 }
 
 /// returns the hash of the given public parameters of the Folding Scheme
-pub fn pp_hash<C1, C2, CS1, CS2>(
+pub fn pp_hash<C1, C2, CS1, CS2, const H: bool>(
     arith: &impl Arith<C1::ScalarField>,
     cf_arith: &impl Arith<C2::ScalarField>,
     cs_vp: &CS1::VerifierParams,
@@ -51,8 +51,8 @@ pub fn pp_hash<C1, C2, CS1, CS2>(
 where
     C1: CurveGroup,
     C2: CurveGroup,
-    CS1: CommitmentScheme<C1>,
-    CS2: CommitmentScheme<C2>,
+    CS1: CommitmentScheme<C1, H>,
+    CS2: CommitmentScheme<C2, H>,
 {
     let mut hasher = Sha3_256::new();
 
@@ -60,9 +60,9 @@ where
     hasher.update(C1::ScalarField::MODULUS_BIT_SIZE.to_le_bytes());
     hasher.update(C2::ScalarField::MODULUS_BIT_SIZE.to_le_bytes());
     // AugmentedFCircuit Arith params
-    hasher.update(arith.params_to_bytes());
+    hasher.update(arith.params_to_le_bytes());
     // CycleFold Circuit Arith params
-    hasher.update(cf_arith.params_to_bytes());
+    hasher.update(cf_arith.params_to_le_bytes());
     // cs_vp & cf_cs_vp (commitments setup)
     let mut cs_vp_bytes = Vec::new();
     cs_vp.serialize_uncompressed(&mut cs_vp_bytes)?;

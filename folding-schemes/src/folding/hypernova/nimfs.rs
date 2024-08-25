@@ -12,7 +12,7 @@ use super::{
     Witness,
 };
 use crate::arith::ccs::CCS;
-use crate::constants::N_BITS_RO;
+use crate::constants::NOVA_N_BITS_RO;
 use crate::transcript::Transcript;
 use crate::utils::sum_check::structs::{IOPProof as SumCheckProof, IOPProverMessage};
 use crate::utils::sum_check::{IOPSumCheck, SumCheck};
@@ -120,6 +120,7 @@ where
                 .map(|(a_i, b_i)| *a_i + b_i)
                 .collect();
 
+            // compute the next power of rho
             rho_i *= rho;
         }
 
@@ -140,8 +141,9 @@ where
         let mut w_folded: Vec<C::ScalarField> = vec![C::ScalarField::zero(); w_lcccs[0].w.len()];
         let mut r_w_folded = C::ScalarField::zero();
 
+        let mut rho_i = C::ScalarField::one();
         for i in 0..(w_lcccs.len() + w_cccs.len()) {
-            let rho_i = rho.pow([i as u64]);
+            // let rho_i = rho.pow([i as u64]);
             let w: Vec<C::ScalarField>;
             let r_w: C::ScalarField;
 
@@ -164,6 +166,9 @@ where
                 .collect();
 
             r_w_folded += rho_i * r_w;
+
+            // compute the next power of rho
+            rho_i *= rho;
         }
         Witness {
             w: w_folded,
@@ -183,7 +188,15 @@ where
         new_instances: &[CCCS<C>],
         w_lcccs: &[Witness<C::ScalarField>],
         w_cccs: &[Witness<C::ScalarField>],
-    ) -> Result<(NIMFSProof<C>, LCCCS<C>, Witness<C::ScalarField>, Vec<bool>), Error> {
+    ) -> Result<
+        (
+            NIMFSProof<C>,
+            LCCCS<C>,
+            Witness<C::ScalarField>,
+            C::ScalarField, // rho
+        ),
+        Error,
+    > {
         // absorb instances to transcript
         transcript.absorb(&running_instances);
         transcript.absorb(&new_instances);
@@ -242,7 +255,7 @@ where
         // Step 6: Get the folding challenge
         let rho_scalar = C::ScalarField::from_le_bytes_mod_order(b"rho");
         transcript.absorb(&rho_scalar);
-        let rho_bits: Vec<bool> = transcript.get_challenge_nbits(N_BITS_RO);
+        let rho_bits: Vec<bool> = transcript.get_challenge_nbits(NOVA_N_BITS_RO);
         let rho: C::ScalarField =
             C::ScalarField::from_bigint(BigInteger::from_bits_le(&rho_bits)).unwrap();
 
@@ -265,7 +278,7 @@ where
             },
             folded_lcccs,
             folded_witness,
-            rho_bits,
+            rho,
         ))
     }
 
@@ -361,7 +374,7 @@ where
         // Step 6: Get the folding challenge
         let rho_scalar = C::ScalarField::from_le_bytes_mod_order(b"rho");
         transcript.absorb(&rho_scalar);
-        let rho_bits: Vec<bool> = transcript.get_challenge_nbits(N_BITS_RO);
+        let rho_bits: Vec<bool> = transcript.get_challenge_nbits(NOVA_N_BITS_RO);
         let rho: C::ScalarField =
             C::ScalarField::from_bigint(BigInteger::from_bits_le(&rho_bits)).unwrap();
 
@@ -410,10 +423,10 @@ pub mod tests {
             Pedersen::<Projective>::setup(&mut rng, ccs.n - ccs.l - 1).unwrap();
 
         let (lcccs, w1) = ccs
-            .to_lcccs::<_, Projective, Pedersen<Projective>>(&mut rng, &pedersen_params, &z1)
+            .to_lcccs::<_, Projective, Pedersen<Projective>, false>(&mut rng, &pedersen_params, &z1)
             .unwrap();
         let (cccs, w2) = ccs
-            .to_cccs::<_, Projective, Pedersen<Projective>>(&mut rng, &pedersen_params, &z2)
+            .to_cccs::<_, Projective, Pedersen<Projective>, false>(&mut rng, &pedersen_params, &z2)
             .unwrap();
 
         lcccs.check_relation(&ccs, &w1).unwrap();
@@ -453,11 +466,11 @@ pub mod tests {
 
         // Create the LCCCS instance out of z_1
         let (running_instance, w1) = ccs
-            .to_lcccs::<_, _, Pedersen<Projective>>(&mut rng, &pedersen_params, &z_1)
+            .to_lcccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, &z_1)
             .unwrap();
         // Create the CCCS instance out of z_2
         let (new_instance, w2) = ccs
-            .to_cccs::<_, _, Pedersen<Projective>>(&mut rng, &pedersen_params, &z_2)
+            .to_cccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, &z_2)
             .unwrap();
 
         // Prover's transcript
@@ -509,7 +522,7 @@ pub mod tests {
         // LCCCS witness
         let z_1 = get_test_z(2);
         let (mut running_instance, mut w1) = ccs
-            .to_lcccs::<_, _, Pedersen<Projective>>(&mut rng, &pedersen_params, &z_1)
+            .to_lcccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, &z_1)
             .unwrap();
 
         let poseidon_config = poseidon_canonical_config::<Fr>();
@@ -526,7 +539,7 @@ pub mod tests {
             let z_2 = get_test_z(i);
 
             let (new_instance, w2) = ccs
-                .to_cccs::<_, _, Pedersen<Projective>>(&mut rng, &pedersen_params, &z_2)
+                .to_cccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, &z_2)
                 .unwrap();
 
             // run the prover side of the multifolding
@@ -590,7 +603,7 @@ pub mod tests {
         let mut w_lcccs = Vec::new();
         for z_i in z_lcccs.iter() {
             let (running_instance, w) = ccs
-                .to_lcccs::<_, _, Pedersen<Projective>>(&mut rng, &pedersen_params, z_i)
+                .to_lcccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, z_i)
                 .unwrap();
             lcccs_instances.push(running_instance);
             w_lcccs.push(w);
@@ -600,7 +613,7 @@ pub mod tests {
         let mut w_cccs = Vec::new();
         for z_i in z_cccs.iter() {
             let (new_instance, w) = ccs
-                .to_cccs::<_, _, Pedersen<Projective>>(&mut rng, &pedersen_params, z_i)
+                .to_cccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, z_i)
                 .unwrap();
             cccs_instances.push(new_instance);
             w_cccs.push(w);
@@ -686,7 +699,7 @@ pub mod tests {
             let mut w_lcccs = Vec::new();
             for z_i in z_lcccs.iter() {
                 let (running_instance, w) = ccs
-                    .to_lcccs::<_, _, Pedersen<Projective>>(&mut rng, &pedersen_params, z_i)
+                    .to_lcccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, z_i)
                     .unwrap();
                 lcccs_instances.push(running_instance);
                 w_lcccs.push(w);
@@ -696,7 +709,7 @@ pub mod tests {
             let mut w_cccs = Vec::new();
             for z_i in z_cccs.iter() {
                 let (new_instance, w) = ccs
-                    .to_cccs::<_, _, Pedersen<Projective>>(&mut rng, &pedersen_params, z_i)
+                    .to_cccs::<_, _, Pedersen<Projective>, false>(&mut rng, &pedersen_params, z_i)
                     .unwrap();
                 cccs_instances.push(new_instance);
                 w_cccs.push(w);

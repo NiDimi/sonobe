@@ -22,14 +22,18 @@ use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, Namespace,
 use ark_std::{log2, Zero};
 use core::{borrow::Borrow, marker::PhantomData};
 
-use super::{circuits::ChallengeGadget, nifs::NIFS};
+use super::{
+    circuits::{ChallengeGadget, CommittedInstanceVar},
+    nifs::NIFS,
+    CommittedInstance, Nova, Witness,
+};
 use crate::arith::r1cs::R1CS;
 use crate::commitment::{pedersen::Params as PedersenParams, CommitmentScheme};
 use crate::folding::circuits::{
+    cyclefold::{CycleFoldCommittedInstance, CycleFoldWitness},
     nonnative::{affine::NonNativeAffineVar, uint::NonNativeUintVar},
     CF1, CF2,
 };
-use crate::folding::nova::{circuits::CommittedInstanceVar, CommittedInstance, Nova, Witness};
 use crate::frontend::FCircuit;
 use crate::transcript::{Transcript, TranscriptVar};
 use crate::utils::{
@@ -156,51 +160,17 @@ where
     }
 }
 
-/// In-circuit representation of the Witness associated to the CommittedInstance, but with
-/// non-native representation, since it is used to represent the CycleFold witness.
-#[derive(Debug, Clone)]
-pub struct CycleFoldWitnessVar<C: CurveGroup> {
-    pub E: Vec<NonNativeUintVar<CF2<C>>>,
-    pub rE: NonNativeUintVar<CF2<C>>,
-    pub W: Vec<NonNativeUintVar<CF2<C>>>,
-    pub rW: NonNativeUintVar<CF2<C>>,
-}
-
-impl<C> AllocVar<Witness<C>, CF2<C>> for CycleFoldWitnessVar<C>
-where
-    C: CurveGroup,
-    <C as ark_ec::CurveGroup>::BaseField: PrimeField,
-{
-    fn new_variable<T: Borrow<Witness<C>>>(
-        cs: impl Into<Namespace<CF2<C>>>,
-        f: impl FnOnce() -> Result<T, SynthesisError>,
-        mode: AllocationMode,
-    ) -> Result<Self, SynthesisError> {
-        f().and_then(|val| {
-            let cs = cs.into();
-
-            let E = Vec::new_variable(cs.clone(), || Ok(val.borrow().E.clone()), mode)?;
-            let rE = NonNativeUintVar::new_variable(cs.clone(), || Ok(val.borrow().rE), mode)?;
-
-            let W = Vec::new_variable(cs.clone(), || Ok(val.borrow().W.clone()), mode)?;
-            let rW = NonNativeUintVar::new_variable(cs.clone(), || Ok(val.borrow().rW), mode)?;
-
-            Ok(Self { E, rE, W, rW })
-        })
-    }
-}
-
 /// Circuit that implements the in-circuit checks needed for the onchain (Ethereum's EVM)
 /// verification.
 #[derive(Clone, Debug)]
-pub struct DeciderEthCircuit<C1, GC1, C2, GC2, CS1, CS2>
+pub struct DeciderEthCircuit<C1, GC1, C2, GC2, CS1, CS2, const H: bool = false>
 where
     C1: CurveGroup,
     GC1: CurveVar<C1, CF2<C1>>,
     C2: CurveGroup,
     GC2: CurveVar<C2, CF2<C2>>,
-    CS1: CommitmentScheme<C1>,
-    CS2: CommitmentScheme<C2>,
+    CS1: CommitmentScheme<C1, H>,
+    CS2: CommitmentScheme<C2, H>,
 {
     _c1: PhantomData<C1>,
     _gc1: PhantomData<GC1>,
@@ -237,8 +207,8 @@ where
     pub cmT: Option<C1>,
     pub r: Option<C1::ScalarField>,
     /// CycleFold running instance
-    pub cf_U_i: Option<CommittedInstance<C2>>,
-    pub cf_W_i: Option<Witness<C2>>,
+    pub cf_U_i: Option<CycleFoldCommittedInstance<C2>>,
+    pub cf_W_i: Option<CycleFoldWitness<C2>>,
 
     /// KZG challenges
     pub kzg_c_W: Option<C1::ScalarField>,
@@ -246,25 +216,26 @@ where
     pub eval_W: Option<C1::ScalarField>,
     pub eval_E: Option<C1::ScalarField>,
 }
-impl<C1, GC1, C2, GC2, CS1, CS2> DeciderEthCircuit<C1, GC1, C2, GC2, CS1, CS2>
+impl<C1, GC1, C2, GC2, CS1, CS2, const H: bool> DeciderEthCircuit<C1, GC1, C2, GC2, CS1, CS2, H>
 where
     C1: CurveGroup,
     C2: CurveGroup,
     GC1: CurveVar<C1, CF2<C1>> + ToConstraintFieldGadget<CF2<C1>>,
     GC2: CurveVar<C2, CF2<C2>> + ToConstraintFieldGadget<CF2<C2>>,
-    CS1: CommitmentScheme<C1>,
+    CS1: CommitmentScheme<C1, H>,
     // enforce that the CS2 is Pedersen commitment scheme, since we're at Ethereum's EVM decider
-    CS2: CommitmentScheme<C2, ProverParams = PedersenParams<C2>>,
+    CS2: CommitmentScheme<C2, H, ProverParams = PedersenParams<C2>>,
     <C1 as Group>::ScalarField: Absorb,
     <C1 as CurveGroup>::BaseField: PrimeField,
 {
+    /// returns an instance of the DeciderEthCircuit from the given Nova struct
     pub fn from_nova<FC: FCircuit<C1::ScalarField>>(
-        nova: Nova<C1, GC1, C2, GC2, FC, CS1, CS2>,
+        nova: Nova<C1, GC1, C2, GC2, FC, CS1, CS2, H>,
     ) -> Result<Self, Error> {
         let mut transcript = PoseidonSponge::<C1::ScalarField>::new(&nova.poseidon_config);
 
         // compute the U_{i+1}, W_{i+1}
-        let (T, cmT) = NIFS::<C1, CS1>::compute_cmT(
+        let (T, cmT) = NIFS::<C1, CS1, H>::compute_cmT(
             &nova.cs_pp,
             &nova.r1cs.clone(),
             &nova.w_i.clone(),
@@ -281,7 +252,7 @@ where
         );
         let r_Fr = C1::ScalarField::from_bigint(BigInteger::from_bits_le(&r_bits))
             .ok_or(Error::OutOfBounds)?;
-        let (W_i1, U_i1) = NIFS::<C1, CS1>::fold_instances(
+        let (W_i1, U_i1) = NIFS::<C1, CS1, H>::fold_instances(
             r_Fr, &nova.W_i, &nova.U_i, &nova.w_i, &nova.u_i, &T, cmT,
         )?;
 
@@ -376,8 +347,8 @@ where
         })?;
 
         let u_dummy_native = CommittedInstance::<C1>::dummy(2);
-        let w_dummy_native = Witness::<C1>::new(
-            vec![C1::ScalarField::zero(); self.r1cs.A.n_cols - 3 /* (3=2+1, since u_i.x.len=2) */],
+        let w_dummy_native = Witness::<C1>::dummy(
+            self.r1cs.A.n_cols - 3, /* (3=2+1, since u_i.x.len=2) */
             self.E_len,
         );
 
@@ -437,7 +408,7 @@ where
         (u_i.x[0]).enforce_equal(&u_i_x)?;
 
         #[cfg(feature = "light-test")]
-        println!("[WARNING]: Running with the 'light-test' feature, skipping the big part of the DeciderEthCircuit.\n           Only for testing purposes.");
+        log::warn!("[WARNING]: Running with the 'light-test' feature, skipping the big part of the DeciderEthCircuit.\n           Only for testing purposes.");
 
         // The following two checks (and their respective allocations) are disabled for normal
         // tests since they take several millions of constraints and would take several minutes
@@ -448,12 +419,18 @@ where
             // imports here instead of at the top of the file, so we avoid having multiple
             // `#[cfg(not(test))]`
             use crate::commitment::pedersen::PedersenGadget;
-            use crate::folding::circuits::cyclefold::{CycleFoldCommittedInstanceVar, CF_IO_LEN};
+            use crate::folding::{
+                circuits::cyclefold::{
+                    CycleFoldCommittedInstanceVar, CycleFoldConfig, CycleFoldWitnessVar,
+                },
+                nova::NovaCycleFoldConfig,
+            };
             use ark_r1cs_std::ToBitsGadget;
 
-            let cf_u_dummy_native = CommittedInstance::<C2>::dummy(CF_IO_LEN);
-            let w_dummy_native = Witness::<C2>::new(
-                vec![C2::ScalarField::zero(); self.cf_r1cs.A.n_cols - 1 - self.cf_r1cs.l],
+            let cf_u_dummy_native =
+                CycleFoldCommittedInstance::<C2>::dummy(NovaCycleFoldConfig::<C1>::IO_LEN);
+            let w_dummy_native = CycleFoldWitness::<C2>::dummy(
+                self.cf_r1cs.A.n_cols - 1 - self.cf_r1cs.l,
                 self.cf_E_len,
             );
             let cf_U_i = CycleFoldCommittedInstanceVar::<C2, GC2>::new_witness(cs.clone(), || {
@@ -519,6 +496,7 @@ where
 
         // Check 7 is temporary disabled due
         // https://github.com/privacy-scaling-explorations/sonobe/issues/80
+        log::warn!("[WARNING]: issue #80 (https://github.com/privacy-scaling-explorations/sonobe/issues/80) is not resolved yet.");
         //
         // 7. check eval_W==p_W(c_W) and eval_E==p_E(c_E)
         // let incircuit_eval_W = evaluate_gadget::<CF1<C1>>(W_i1.W, incircuit_c_W)?;
@@ -787,6 +765,7 @@ pub mod tests {
             CubicFCircuit<Fr>,
             Pedersen<Projective>,
             Pedersen<Projective2>,
+            false,
         >;
 
         let prep_param = PreprocessorParam::<
@@ -795,21 +774,17 @@ pub mod tests {
             CubicFCircuit<Fr>,
             Pedersen<Projective>,
             Pedersen<Projective2>,
+            false,
         >::new(poseidon_config, F_circuit);
-        let (prover_params, verifier_params) = N::preprocess(&mut rng, &prep_param).unwrap();
+        let nova_params = N::preprocess(&mut rng, &prep_param).unwrap();
 
         // generate a Nova instance and do a step of it
-        let mut nova = N::init(
-            (prover_params, verifier_params.clone()),
-            F_circuit,
-            z_0.clone(),
-        )
-        .unwrap();
-        nova.prove_step(&mut rng, vec![]).unwrap();
+        let mut nova = N::init(&nova_params, F_circuit, z_0.clone()).unwrap();
+        nova.prove_step(&mut rng, vec![], None).unwrap();
         let ivc_v = nova.clone();
         let (running_instance, incoming_instance, cyclefold_instance) = ivc_v.instances();
         N::verify(
-            verifier_params,
+            nova_params.1, // verifier_params
             z_0,
             ivc_v.z_i,
             Fr::one(),

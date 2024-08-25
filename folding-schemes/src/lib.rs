@@ -41,6 +41,8 @@ pub enum Error {
     SNARKVerificationFail,
     #[error("IVC verification failed")]
     IVCVerificationFail,
+    #[error("zkIVC verification failed")]
+    zkIVCVerificationFail,
     #[error("R1CS instance is expected to not be relaxed")]
     R1CSUnrelaxedFail,
     #[error("Could not find the inner ConstraintSystem")]
@@ -69,12 +71,16 @@ pub enum Error {
     NotEnoughSteps,
     #[error("Evaluation failed")]
     EvaluationFail,
+    #[error("{0} can not be zero")]
+    CantBeZero(String),
 
     // Commitment errors
     #[error("Pedersen parameters length is not sufficient (generators.len={0} < vector.len={1} unsatisfied)")]
     PedersenParamsLen(usize, usize),
     #[error("Blinding factor not 0 for Commitment without hiding")]
     BlindingNotZero,
+    #[error("Blinding factors incorrect, blinding is set to {0} but blinding values are {1}")]
+    IncorrectBlinding(bool, String),
     #[error("Commitment verification failed")]
     CommitmentVerificationFail,
 
@@ -91,10 +97,16 @@ pub enum Error {
     NotSupported(String),
     #[error("max i-th step reached (usize limit reached)")]
     MaxStep,
-    #[error("Circom Witness calculation error: {0}")]
+    #[error("Witness calculation error: {0}")]
     WitnessCalculationError(String),
     #[error("BigInt to PrimeField conversion error: {0}")]
     BigIntConversionError(String),
+    #[error("Failed to serde: {0}")]
+    JSONSerdeError(String),
+    #[error("Multi instances folding not supported in this scheme")]
+    NoMultiInstances,
+    #[error("Missing 'other' instances, since this is a multi-instances folding scheme")]
+    MissingOtherInstances,
 }
 
 /// FoldingScheme defines trait that is implemented by the diverse folding schemes. It is defined
@@ -114,6 +126,7 @@ where
     type VerifierParam: Debug + Clone;
     type RunningInstance: Debug; // contains the CommittedInstance + Witness
     type IncomingInstance: Debug; // contains the CommittedInstance + Witness
+    type MultiCommittedInstanceWithWitness: Debug; // type used for the extra instances in the multi-instance folding setting
     type CFInstance: Debug; // CycleFold CommittedInstance & Witness
 
     fn preprocess(
@@ -122,7 +135,7 @@ where
     ) -> Result<(Self::ProverParam, Self::VerifierParam), Error>;
 
     fn init(
-        params: (Self::ProverParam, Self::VerifierParam),
+        params: &(Self::ProverParam, Self::VerifierParam),
         step_circuit: FC,
         z_0: Vec<C1::ScalarField>, // initial state
     ) -> Result<Self, Error>;
@@ -131,6 +144,7 @@ where
         &mut self,
         rng: impl RngCore,
         external_inputs: Vec<C1::ScalarField>,
+        other_instances: Option<Self::MultiCommittedInstanceWithWitness>,
     ) -> Result<(), Error>;
 
     // returns the state at the current step
@@ -156,6 +170,35 @@ where
         incoming_instance: Self::IncomingInstance,
         cyclefold_instance: Self::CFInstance,
     ) -> Result<(), Error>;
+}
+
+/// Trait with auxiliary methods for multi-folding schemes (ie. HyperNova, ProtoGalaxy, etc),
+/// allowing to create new instances for the multifold.
+pub trait MultiFolding<C1: CurveGroup, C2: CurveGroup, FC>: Clone + Debug
+where
+    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
+    C2::BaseField: PrimeField,
+    FC: FCircuit<C1::ScalarField>,
+{
+    type RunningInstance: Debug;
+    type IncomingInstance: Debug;
+    type MultiInstance: Debug;
+
+    /// Creates a new RunningInstance for the given state, to be folded in the multi-folding step.
+    fn new_running_instance(
+        &self,
+        rng: impl RngCore,
+        state: Vec<C1::ScalarField>,
+        external_inputs: Vec<C1::ScalarField>,
+    ) -> Result<Self::RunningInstance, Error>;
+
+    /// Creates a new IncomingInstance for the given state, to be folded in the multi-folding step.
+    fn new_incoming_instance(
+        &self,
+        rng: impl RngCore,
+        state: Vec<C1::ScalarField>,
+        external_inputs: Vec<C1::ScalarField>,
+    ) -> Result<Self::IncomingInstance, Error>;
 }
 
 pub trait Decider<
