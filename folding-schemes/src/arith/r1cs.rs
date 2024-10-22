@@ -1,15 +1,13 @@
-use crate::commitment::CommitmentScheme;
-use crate::folding::nova::{CommittedInstance, Witness};
-use crate::RngCore;
-use ark_crypto_primitives::sponge::Absorb;
-use ark_ec::{CurveGroup, Group};
 use ark_ff::PrimeField;
 use ark_relations::r1cs::ConstraintSystem;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::Rng;
 
-use super::Arith;
-use crate::utils::vec::{hadamard, mat_vec_mul, vec_add, vec_scalar_mul, vec_sub, SparseMatrix};
+use super::ccs::CCS;
+use super::{Arith, ArithSerializer};
+use crate::utils::vec::{
+    hadamard, is_zero_vec, mat_vec_mul, vec_scalar_mul, vec_sub, SparseMatrix,
+};
 use crate::Error;
 
 #[derive(Debug, Clone, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
@@ -20,19 +18,42 @@ pub struct R1CS<F: PrimeField> {
     pub C: SparseMatrix<F>,
 }
 
-impl<F: PrimeField> Arith<F> for R1CS<F> {
-    /// check that a R1CS structure is satisfied by a z vector. Only for testing.
-    fn check_relation(&self, z: &[F]) -> Result<(), Error> {
+impl<F: PrimeField> R1CS<F> {
+    /// Evaluates the CCS relation at a given vector of variables `z`
+    pub fn eval_at_z(&self, z: &[F]) -> Result<Vec<F>, Error> {
+        if z.len() != self.A.n_cols {
+            return Err(Error::NotSameLength(
+                "z.len()".to_string(),
+                z.len(),
+                "number of variables in R1CS".to_string(),
+                self.A.n_cols,
+            ));
+        }
+
         let Az = mat_vec_mul(&self.A, z)?;
         let Bz = mat_vec_mul(&self.B, z)?;
         let Cz = mat_vec_mul(&self.C, z)?;
+        // Multiply Cz by z[0] (u) here, allowing this method to be reused for
+        // both relaxed and plain R1CS.
+        let uCz = vec_scalar_mul(&Cz, &z[0]);
         let AzBz = hadamard(&Az, &Bz)?;
-        if AzBz != Cz {
-            return Err(Error::NotSatisfied);
-        }
-        Ok(())
+        vec_sub(&AzBz, &uCz)
+    }
+}
+
+impl<F: PrimeField, W: AsRef<[F]>, U: AsRef<[F]>> Arith<W, U> for R1CS<F> {
+    type Evaluation = Vec<F>;
+
+    fn eval_relation(&self, w: &W, u: &U) -> Result<Self::Evaluation, Error> {
+        self.eval_at_z(&[&[F::one()], u.as_ref(), w.as_ref()].concat())
     }
 
+    fn check_evaluation(_w: &W, _u: &U, e: Self::Evaluation) -> Result<(), Error> {
+        is_zero_vec(&e).then_some(()).ok_or(Error::NotSatisfied)
+    }
+}
+
+impl<F: PrimeField> ArithSerializer for R1CS<F> {
     fn params_to_le_bytes(&self) -> Vec<u8> {
         [
             self.l.to_le_bytes(),
@@ -44,6 +65,14 @@ impl<F: PrimeField> Arith<F> for R1CS<F> {
 }
 
 impl<F: PrimeField> R1CS<F> {
+    pub fn empty() -> Self {
+        R1CS {
+            l: 0,
+            A: SparseMatrix::empty(),
+            B: SparseMatrix::empty(),
+            C: SparseMatrix::empty(),
+        }
+    }
     pub fn rand<R: Rng>(rng: &mut R, n_rows: usize, n_cols: usize) -> Self {
         Self {
             l: 1,
@@ -53,127 +82,40 @@ impl<F: PrimeField> R1CS<F> {
         }
     }
 
+    #[inline]
+    pub fn num_constraints(&self) -> usize {
+        self.A.n_rows
+    }
+
+    #[inline]
+    pub fn num_public_inputs(&self) -> usize {
+        self.l
+    }
+
+    #[inline]
+    pub fn num_variables(&self) -> usize {
+        self.A.n_cols
+    }
+
+    #[inline]
+    pub fn num_witnesses(&self) -> usize {
+        self.num_variables() - self.num_public_inputs() - 1
+    }
+
     /// returns a tuple containing (w, x) (witness and public inputs respectively)
     pub fn split_z(&self, z: &[F]) -> (Vec<F>, Vec<F>) {
         (z[self.l + 1..].to_vec(), z[1..self.l + 1].to_vec())
     }
-
-    /// converts the R1CS instance into a RelaxedR1CS as described in
-    /// [Nova](https://eprint.iacr.org/2021/370.pdf) section 4.1.
-    pub fn relax(self) -> RelaxedR1CS<F> {
-        RelaxedR1CS::<F> {
-            l: self.l,
-            E: vec![F::zero(); self.A.n_rows],
-            A: self.A,
-            B: self.B,
-            C: self.C,
-            u: F::one(),
-        }
-    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct RelaxedR1CS<F: PrimeField> {
-    pub l: usize, // io len
-    pub A: SparseMatrix<F>,
-    pub B: SparseMatrix<F>,
-    pub C: SparseMatrix<F>,
-    pub u: F,
-    pub E: Vec<F>,
-}
-
-impl<F: PrimeField> RelaxedR1CS<F> {
-    /// check that a RelaxedR1CS structure is satisfied by a z vector. Only for testing.
-    pub fn check_relation(&self, z: &[F]) -> Result<(), Error> {
-        let Az = mat_vec_mul(&self.A, z)?;
-        let Bz = mat_vec_mul(&self.B, z)?;
-        let Cz = mat_vec_mul(&self.C, z)?;
-        let uCz = vec_scalar_mul(&Cz, &self.u);
-        let uCzE = vec_add(&uCz, &self.E)?;
-        let AzBz = hadamard(&Az, &Bz)?;
-        if AzBz != uCzE {
-            return Err(Error::NotSatisfied);
+impl<F: PrimeField> From<CCS<F>> for R1CS<F> {
+    fn from(ccs: CCS<F>) -> Self {
+        R1CS::<F> {
+            l: ccs.l,
+            A: ccs.M[0].clone(),
+            B: ccs.M[1].clone(),
+            C: ccs.M[2].clone(),
         }
-
-        Ok(())
-    }
-
-    // Computes the E term, given A, B, C, z, u
-    fn compute_E(
-        A: &SparseMatrix<F>,
-        B: &SparseMatrix<F>,
-        C: &SparseMatrix<F>,
-        z: &[F],
-        u: &F,
-    ) -> Result<Vec<F>, Error> {
-        let Az = mat_vec_mul(A, z)?;
-        let Bz = mat_vec_mul(B, z)?;
-        let AzBz = hadamard(&Az, &Bz)?;
-
-        let Cz = mat_vec_mul(C, z)?;
-        let uCz = vec_scalar_mul(&Cz, u);
-        vec_sub(&AzBz, &uCz)
-    }
-
-    pub fn check_sampled_relaxed_r1cs(&self, u: F, E: &[F], z: &[F]) -> bool {
-        let sampled = RelaxedR1CS {
-            l: self.l,
-            A: self.A.clone(),
-            B: self.B.clone(),
-            C: self.C.clone(),
-            u,
-            E: E.to_vec(),
-        };
-        sampled.check_relation(z).is_ok()
-    }
-
-    // Implements sampling a (committed) RelaxedR1CS
-    // See construction 5 in https://eprint.iacr.org/2023/573.pdf
-    pub fn sample<C, CS>(
-        &self,
-        params: &CS::ProverParams,
-        mut rng: impl RngCore,
-    ) -> Result<(CommittedInstance<C>, Witness<C>), Error>
-    where
-        C: CurveGroup,
-        C: CurveGroup<ScalarField = F>,
-        <C as Group>::ScalarField: Absorb,
-        CS: CommitmentScheme<C, true>,
-    {
-        let u = C::ScalarField::rand(&mut rng);
-        let rE = C::ScalarField::rand(&mut rng);
-        let rW = C::ScalarField::rand(&mut rng);
-
-        let W = (0..self.A.n_cols - self.l - 1)
-            .map(|_| F::rand(&mut rng))
-            .collect();
-        let x = (0..self.l).map(|_| F::rand(&mut rng)).collect::<Vec<F>>();
-        let mut z = vec![u];
-        z.extend(&x);
-        z.extend(&W);
-
-        let E = RelaxedR1CS::compute_E(&self.A, &self.B, &self.C, &z, &u)?;
-
-        debug_assert!(
-            z.len() == self.A.n_cols,
-            "Length of z is {}, while A has {} columns.",
-            z.len(),
-            self.A.n_cols
-        );
-
-        debug_assert!(
-            self.check_sampled_relaxed_r1cs(u, &E, &z),
-            "Sampled a non satisfiable relaxed R1CS, sampled u: {}, computed E: {:?}",
-            u,
-            E
-        );
-
-        let witness = Witness { E, rE, W, rW };
-        let mut cm_witness = witness.commit::<CS, true>(params, x)?;
-
-        // witness.commit() sets u to 1, we set it to the sampled u value
-        cm_witness.u = u;
-        Ok((cm_witness, witness))
     }
 }
 
@@ -221,24 +163,12 @@ pub fn extract_w_x<F: PrimeField>(cs: &ConstraintSystem<F>) -> (Vec<F>, Vec<F>) 
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::{
-        commitment::pedersen::Pedersen,
-        utils::vec::tests::{to_F_matrix, to_F_vec},
+    use crate::utils::vec::{
+        is_zero_vec,
+        tests::{to_F_matrix, to_F_vec},
     };
 
-    use ark_pallas::{Fr, Projective};
-
-    #[test]
-    pub fn sample_relaxed_r1cs() {
-        let rng = rand::rngs::OsRng;
-        let r1cs = get_test_r1cs::<Fr>();
-        let (prover_params, _) = Pedersen::<Projective>::setup(rng, r1cs.A.n_rows).unwrap();
-
-        let relaxed_r1cs = r1cs.relax();
-        let sampled =
-            relaxed_r1cs.sample::<Projective, Pedersen<Projective, true>>(&prover_params, rng);
-        assert!(sampled.is_ok());
-    }
+    use ark_pallas::Fr;
 
     pub fn get_test_r1cs<F: PrimeField>() -> R1CS<F> {
         // R1CS for: x^3 + x + 5 = y (example from article
@@ -294,10 +224,23 @@ pub mod tests {
     }
 
     #[test]
-    fn test_check_relation() {
+    fn test_eval_r1cs_relation() {
+        let mut rng = ark_std::test_rng();
         let r1cs = get_test_r1cs::<Fr>();
-        let z = get_test_z(5);
-        r1cs.check_relation(&z).unwrap();
-        r1cs.relax().check_relation(&z).unwrap();
+        let (_, x, mut w) = get_test_z_split::<Fr>(rng.gen::<u16>() as usize);
+
+        let f_w = r1cs.eval_relation(&w, &x).unwrap();
+        assert!(is_zero_vec(&f_w));
+
+        w[1] = Fr::from(111);
+        let f_w = r1cs.eval_relation(&w, &x).unwrap();
+        assert!(!is_zero_vec(&f_w));
+    }
+
+    #[test]
+    fn test_check_r1cs_relation() {
+        let r1cs = get_test_r1cs::<Fr>();
+        let (_, x, w) = get_test_z_split(5);
+        r1cs.check_relation(&w, &x).unwrap();
     }
 }
