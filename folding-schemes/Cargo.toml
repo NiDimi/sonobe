@@ -27,7 +27,6 @@ log = "0.4"
 
 # tmp import for espresso's sumcheck
 espresso_subroutines = {git="https://github.com/EspressoSystems/hyperplonk", package="subroutines"}
-num-traits = "0.2.15"
 
 [dev-dependencies]
 ark-pallas = {version="0.4.0", features=["r1cs"]}
@@ -66,7 +65,3 @@ path = "../examples/multi_inputs.rs"
 name = "external_inputs"
 path = "../examples/external_inputs.rs"
 
-
-[[example]]
-name = "sumcheck"
-path = "../examples/sumcheck_fail.rs"
