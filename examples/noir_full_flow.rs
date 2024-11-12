@@ -16,17 +16,18 @@ use ark_grumpkin::{constraints::GVar as GVar2, Projective as G2};
 
 use folding_schemes::{
     commitment::{kzg::KZG, pedersen::Pedersen},
-    folding::nova::{
-        decider_eth::{prepare_calldata, Decider as DeciderEth},
-        Nova, PreprocessorParam,
+    folding::{
+        nova::{
+            decider_eth::{prepare_calldata, Decider as DeciderEth},
+            Nova, PreprocessorParam,
+        },
+        traits::CommittedInstanceOps,
     },
-    frontend::{
-        noir::{load_noir_circuit, NoirFCircuit},
-        FCircuit,
-    },
+    frontend::FCircuit,
     transcript::poseidon::poseidon_canonical_config,
     Decider, FoldingScheme,
 };
+use frontends::noir::{load_noir_circuit, NoirFCircuit};
 use std::{env, time::Instant};
 
 use solidity_verifiers::{
@@ -44,11 +45,11 @@ fn main() {
     let cur_path = env::current_dir().unwrap();
 
     let circuit_path = format!(
-        "{}/folding-schemes/src/frontend/noir/test_folder/test_mimc/target/test_mimc.json",
+        "{}/frontends/src/noir/test_folder/test_mimc/target/test_mimc.json",
         cur_path.to_str().unwrap()
     );
 
-    let circuit = load_noir_circuit(circuit_path);
+    let circuit = load_noir_circuit(circuit_path).unwrap();
     let f_circuit = NoirFCircuit {
         circuit,
         state_len: 1,
@@ -105,8 +106,8 @@ fn main() {
         nova.i,
         nova.z_0.clone(),
         nova.z_i.clone(),
-        &nova.U_i,
-        &nova.u_i,
+        &nova.U_i.get_commitments(),
+        &nova.u_i.get_commitments(),
         &proof,
     )
     .unwrap();

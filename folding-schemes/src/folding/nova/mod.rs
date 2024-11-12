@@ -1,12 +1,16 @@
 /// Implements the scheme described in [Nova](https://eprint.iacr.org/2021/370.pdf) and
 /// [CycleFold](https://eprint.iacr.org/2023/1192.pdf).
+///
+/// The structure of the Nova code is the following:
+/// - NIFS implementation for Nova (nifs.rs), Mova (mova.rs), Ova (ova.rs)
+/// - IVC and the Decider (offchain Decider & onchain Decider) implementations for Nova
 use ark_crypto_primitives::sponge::{
     poseidon::{PoseidonConfig, PoseidonSponge},
     Absorb, CryptographicSponge,
 };
 use ark_ec::{CurveGroup, Group};
 use ark_ff::{BigInteger, PrimeField};
-use ark_r1cs_std::{groups::GroupOpsBounds, prelude::CurveVar, ToConstraintFieldGadget};
+use ark_r1cs_std::{prelude::CurveVar, ToConstraintFieldGadget};
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystem};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Valid};
 use ark_std::fmt::Debug;
@@ -36,14 +40,14 @@ use crate::{
 use crate::{arith::Arith, commitment::CommitmentScheme};
 
 pub mod circuits;
-pub mod nifs;
-pub mod ova;
 pub mod traits;
 pub mod zk;
 
-use circuits::{AugmentedFCircuit, ChallengeGadget, CommittedInstanceVar};
-use nifs::NIFS;
-use traits::NIFSTrait;
+// NIFS related:
+pub mod nifs;
+
+use circuits::{AugmentedFCircuit, CommittedInstanceVar};
+use nifs::{nova::NIFS, NIFSTrait};
 
 // offchain decider
 pub mod decider;
@@ -52,7 +56,7 @@ pub mod decider_circuits;
 pub mod decider_eth;
 pub mod decider_eth_circuit;
 
-use super::traits::{CommittedInstanceOps, WitnessOps};
+use super::traits::{CommittedInstanceOps, Inputize, WitnessOps};
 
 /// Configuration for Nova's CycleFold circuit
 pub struct NovaCycleFoldConfig<C: CurveGroup> {
@@ -130,6 +134,18 @@ impl<C: CurveGroup> CommittedInstanceOps<C> for CommittedInstance<C> {
 
     fn is_incoming(&self) -> bool {
         self.cmE == C::zero() && self.u == One::one()
+    }
+}
+
+impl<C: CurveGroup> Inputize<C::ScalarField, CommittedInstanceVar<C>> for CommittedInstance<C> {
+    fn inputize(&self) -> Vec<C::ScalarField> {
+        [
+            &[self.u][..],
+            &self.x,
+            &self.cmE.inputize(),
+            &self.cmW.inputize(),
+        ]
+        .concat()
     }
 }
 
@@ -473,8 +489,6 @@ where
     <C1 as Group>::ScalarField: Absorb,
     <C2 as Group>::ScalarField: Absorb,
     C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    for<'a> &'a GC1: GroupOpsBounds<'a, C1, GC1>,
-    for<'a> &'a GC2: GroupOpsBounds<'a, C2, GC2>,
 {
     type PreprocessorParam = PreprocessorParam<C1, C2, FC, CS1, CS2, H>;
     type ProverParam = ProverParams<C1, C2, CS1, CS2, H>;
@@ -514,7 +528,7 @@ where
         augmented_F_circuit.generate_constraints(cs.clone())?;
         cs.finalize();
         let cs = cs.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
-        let r1cs = extract_r1cs::<C1::ScalarField>(&cs);
+        let r1cs = extract_r1cs::<C1::ScalarField>(&cs)?;
 
         // CycleFold circuit R1CS
         let cs2 = ConstraintSystem::<C1::BaseField>::new_ref();
@@ -522,7 +536,7 @@ where
         cf_circuit.generate_constraints(cs2.clone())?;
         cs2.finalize();
         let cs2 = cs2.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
-        let cf_r1cs = extract_r1cs::<C1::BaseField>(&cs2);
+        let cf_r1cs = extract_r1cs::<C1::BaseField>(&cs2)?;
 
         let cs_vp = CS1::VerifierParams::deserialize_with_mode(&mut reader, compress, validate)?;
         let cf_cs_vp = CS2::VerifierParams::deserialize_with_mode(&mut reader, compress, validate)?;
@@ -544,23 +558,14 @@ where
             get_r1cs::<C1, GC1, C2, GC2, FC>(&prep_param.poseidon_config, prep_param.F.clone())?;
 
         // if cs params exist, use them, if not, generate new ones
-        let cs_pp: CS1::ProverParams;
-        let cs_vp: CS1::VerifierParams;
-        let cf_cs_pp: CS2::ProverParams;
-        let cf_cs_vp: CS2::VerifierParams;
-        if prep_param.cs_pp.is_some()
-            && prep_param.cf_cs_pp.is_some()
-            && prep_param.cs_vp.is_some()
-            && prep_param.cf_cs_vp.is_some()
-        {
-            cs_pp = prep_param.clone().cs_pp.unwrap();
-            cs_vp = prep_param.clone().cs_vp.unwrap();
-            cf_cs_pp = prep_param.clone().cf_cs_pp.unwrap();
-            cf_cs_vp = prep_param.clone().cf_cs_vp.unwrap();
-        } else {
-            (cs_pp, cs_vp) = CS1::setup(&mut rng, r1cs.A.n_rows)?;
-            (cf_cs_pp, cf_cs_vp) = CS2::setup(&mut rng, cf_r1cs.A.n_rows)?;
-        }
+        let (cs_pp, cs_vp) = match (&prep_param.cs_pp, &prep_param.cs_vp) {
+            (Some(cs_pp), Some(cs_vp)) => (cs_pp.clone(), cs_vp.clone()),
+            _ => CS1::setup(&mut rng, r1cs.A.n_rows)?,
+        };
+        let (cf_cs_pp, cf_cs_vp) = match (&prep_param.cf_cs_pp, &prep_param.cf_cs_vp) {
+            (Some(cf_cs_pp), Some(cf_cs_vp)) => (cf_cs_pp.clone(), cf_cs_vp.clone()),
+            _ => CS2::setup(&mut rng, cf_r1cs.A.n_rows)?,
+        };
 
         let prover_params = ProverParams::<C1, C2, CS1, CS2, H> {
             poseidon_config: prep_param.poseidon_config.clone(),
@@ -597,12 +602,12 @@ where
         augmented_F_circuit.generate_constraints(cs.clone())?;
         cs.finalize();
         let cs = cs.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
-        let r1cs = extract_r1cs::<C1::ScalarField>(&cs);
+        let r1cs = extract_r1cs::<C1::ScalarField>(&cs)?;
 
         cf_circuit.generate_constraints(cs2.clone())?;
         cs2.finalize();
         let cs2 = cs2.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
-        let cf_r1cs = extract_r1cs::<C1::BaseField>(&cs2);
+        let cf_r1cs = extract_r1cs::<C1::BaseField>(&cs2)?;
 
         // compute the public params hash
         let pp_hash = vp.pp_hash()?;
@@ -714,27 +719,20 @@ where
             .F
             .step_native(i_usize, self.z_i.clone(), external_inputs.clone())?;
 
-        // compute T and cmT for AugmentedFCircuit
-        let (aux_p, aux_v) = self.compute_cmT()?;
-        let cmT = aux_v;
-
-        // r_bits is the r used to the RLC of the F' instances
-        let r_bits = ChallengeGadget::<C1, CommittedInstance<C1>>::get_challenge_native(
-            &mut transcript,
-            self.pp_hash,
-            &self.U_i,
-            &self.u_i,
-            Some(&cmT),
-        );
-        let r_Fr = C1::ScalarField::from_bigint(BigInteger::from_bits_le(&r_bits))
-            .ok_or(Error::OutOfBounds)?;
+        // fold Nova instances
+        let (W_i1, U_i1, cmT, r_bits): (Witness<C1>, CommittedInstance<C1>, C1, Vec<bool>) =
+            NIFS::<C1, CS1, PoseidonSponge<C1::ScalarField>, H>::prove(
+                &self.cs_pp,
+                &self.r1cs,
+                &mut transcript,
+                self.pp_hash,
+                &self.W_i,
+                &self.U_i,
+                &self.w_i,
+                &self.u_i,
+            )?;
         let r_Fq = C1::BaseField::from_bigint(BigInteger::from_bits_le(&r_bits))
             .ok_or(Error::OutOfBounds)?;
-
-        // fold Nova instances
-        let (W_i1, U_i1): (Witness<C1>, CommittedInstance<C1>) = NIFS::<C1, CS1, H>::prove(
-            r_Fr, &self.W_i, &self.U_i, &self.w_i, &self.u_i, &aux_p, &aux_v,
-        )?;
 
         // folded instance output (public input, x)
         // u_{i+1}.x[0] = H(i+1, z_0, z_{i+1}, U_{i+1})
@@ -776,7 +774,15 @@ where
             };
 
             #[cfg(test)]
-            NIFS::<C1, CS1, H>::verify_folded_instance(r_Fr, &self.U_i, &self.u_i, &U_i1, &cmT)?;
+            {
+                let r_Fr = C1::ScalarField::from_bigint(BigInteger::from_bits_le(&r_bits))
+                    .ok_or(Error::OutOfBounds)?;
+                let expected =
+                    NIFS::<C1, CS1, PoseidonSponge<C1::ScalarField>, H>::fold_committed_instances(
+                        r_Fr, &self.U_i, &self.u_i, &cmT,
+                    );
+                assert_eq!(U_i1, expected);
+            }
         } else {
             // CycleFold part:
             // get the vector used as public inputs 'x' in the CycleFold circuit
@@ -941,7 +947,7 @@ where
         } = ivc_proof;
         let (pp, vp) = params;
 
-        let f_circuit = FC::new(fcircuit_params).unwrap();
+        let f_circuit = FC::new(fcircuit_params)?;
         let cs = ConstraintSystem::<C1::ScalarField>::new_ref();
         let cs2 = ConstraintSystem::<C1::BaseField>::new_ref();
         let augmented_F_circuit =
@@ -951,12 +957,12 @@ where
         augmented_F_circuit.generate_constraints(cs.clone())?;
         cs.finalize();
         let cs = cs.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
-        let r1cs = extract_r1cs::<C1::ScalarField>(&cs);
+        let r1cs = extract_r1cs::<C1::ScalarField>(&cs)?;
 
         cf_circuit.generate_constraints(cs2.clone())?;
         cs2.finalize();
         let cs2 = cs2.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
-        let cf_r1cs = extract_r1cs::<C1::BaseField>(&cs2);
+        let cf_r1cs = extract_r1cs::<C1::BaseField>(&cs2)?;
 
         Ok(Self {
             _gc1: PhantomData,
@@ -1042,33 +1048,6 @@ where
     C1: CurveGroup,
     GC1: CurveVar<C1, CF2<C1>> + ToConstraintFieldGadget<CF2<C1>>,
     C2: CurveGroup,
-    GC2: CurveVar<C2, CF2<C2>>,
-    FC: FCircuit<C1::ScalarField>,
-    CS1: CommitmentScheme<C1, H>,
-    CS2: CommitmentScheme<C2, H>,
-    <C2 as CurveGroup>::BaseField: PrimeField,
-    <C1 as Group>::ScalarField: Absorb,
-    <C2 as Group>::ScalarField: Absorb,
-    C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-{
-    // computes T and cmT for the AugmentedFCircuit
-    fn compute_cmT(&self) -> Result<(Vec<C1::ScalarField>, C1), Error> {
-        NIFS::<C1, CS1, H>::compute_aux(
-            &self.cs_pp,
-            &self.r1cs,
-            &self.w_i,
-            &self.u_i,
-            &self.W_i,
-            &self.U_i,
-        )
-    }
-}
-
-impl<C1, GC1, C2, GC2, FC, CS1, CS2, const H: bool> Nova<C1, GC1, C2, GC2, FC, CS1, CS2, H>
-where
-    C1: CurveGroup,
-    GC1: CurveVar<C1, CF2<C1>> + ToConstraintFieldGadget<CF2<C1>>,
-    C2: CurveGroup,
     GC2: CurveVar<C2, CF2<C2>> + ToConstraintFieldGadget<CF2<C2>>,
     FC: FCircuit<C1::ScalarField>,
     CS1: CommitmentScheme<C1, H>,
@@ -1078,8 +1057,6 @@ where
     <C1 as Group>::ScalarField: Absorb,
     <C2 as Group>::ScalarField: Absorb,
     C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    for<'a> &'a GC1: GroupOpsBounds<'a, C1, GC1>,
-    for<'a> &'a GC2: GroupOpsBounds<'a, C2, GC2>,
 {
     // folds the given cyclefold circuit and its instances
     #[allow(clippy::type_complexity)]
@@ -1124,7 +1101,7 @@ pub fn get_r1cs_from_cs<F: PrimeField>(
     circuit.generate_constraints(cs.clone())?;
     cs.finalize();
     let cs = cs.into_inner().ok_or(Error::NoInnerConstraintSystem)?;
-    let r1cs = extract_r1cs::<F>(&cs);
+    let r1cs = extract_r1cs::<F>(&cs)?;
     Ok(r1cs)
 }
 
@@ -1145,8 +1122,6 @@ where
     <C1 as Group>::ScalarField: Absorb,
     <C2 as Group>::ScalarField: Absorb,
     C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    for<'a> &'a GC1: GroupOpsBounds<'a, C1, GC1>,
-    for<'a> &'a GC2: GroupOpsBounds<'a, C2, GC2>,
 {
     let augmented_F_circuit =
         AugmentedFCircuit::<C1, C2, GC2, FC>::empty(poseidon_config, F_circuit);
@@ -1173,8 +1148,6 @@ where
     <C1 as Group>::ScalarField: Absorb,
     <C2 as Group>::ScalarField: Absorb,
     C1: CurveGroup<BaseField = C2::ScalarField, ScalarField = C2::BaseField>,
-    for<'a> &'a GC1: GroupOpsBounds<'a, C1, GC1>,
-    for<'a> &'a GC2: GroupOpsBounds<'a, C2, GC2>,
 {
     let (r1cs, cf_r1cs) = get_r1cs::<C1, GC1, C2, GC2, FC>(poseidon_config, F_circuit)?;
     Ok((r1cs.A.n_rows, cf_r1cs.A.n_rows))
